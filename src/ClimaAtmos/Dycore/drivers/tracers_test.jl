@@ -199,12 +199,13 @@ let
 
   @hascuda device!(MPI.Comm_rank(mpicomm) % length(devices()))
 
-  nmoist = 1
+  nmoist = 5
   ntrace = 2
   Ne = (10, 10, 10)
   N = 4
   timeend = 0.1
-  for DFloat in (Float64,Float32)
+  # for DFloat in (Float64,Float32)
+  for DFloat in (Float64,)
     for ArrayType in (HAVE_CUDA ? (CuArray, Array) : (Array,))
       for dim in 2:3
         brickrange = ntuple(j->range(DFloat(0); length=Ne[j]+1, stop=1000), dim)

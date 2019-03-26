@@ -5,6 +5,7 @@ using ..CLIMAAtmosDycore
 AD = CLIMAAtmosDycore
 using ..Grids
 using ..AtmosStateArrays
+using StaticArrays
 
 export VanillaAtmosDiscretization
 

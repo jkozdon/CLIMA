@@ -567,9 +567,28 @@ end
 # }}}
 
 # {{{ Volume RHS for 3-D
+function eulerflux!(::Val{nmoist}, flux, Qstate, ρ_gravity) where nmoist
+  @inbounds begin
+    ρ, U, V, W, E = Qstate[_ρ], Qstate[_U], Qstate[_V], Qstate[_W], Qstate[_E]
+    ρinv = 1 / ρ
+    u, v, w = ρinv * U, ρinv * V, ρinv * W
+    P = gdm1*(E - (U^2 + V^2 + W^2)/(2*ρ) - ρ_gravity)
+    flux[1, _ρ], flux[2, _ρ], flux[3, _ρ] = U          , V          , W
+    flux[1, _U], flux[2, _U], flux[3, _U] = u * U  + P , v * U      , w * U
+    flux[1, _V], flux[2, _V], flux[3, _V] = u * V      , v * V + P  , w * V
+    flux[1, _W], flux[2, _W], flux[3, _W] = u * W      , v * W      , w * W + P
+    flux[1, _E], flux[2, _E], flux[3, _E] = u * (E + P), v * (E + P), w * (E + P)
+    for m = 1:nmoist
+      s = _nstate + m
+      q = Qstate[s]
+      flux[1, s], flux[2, s], flux[3, s] = u * q, v * q, w * q
+    end
+  end
+end
+
 function volumerhs!(::Val{3}, ::Val{N}, ::Val{nmoist}, ::Val{ntrace},
                     rhs::Array, Q, grad, vgeo, gravity, viscosity, D,
-                    elems) where {N, nmoist, ntrace}
+                    elems, fluxfun! = eulerflux!) where {N, nmoist, ntrace}
   DFloat = eltype(Q)
 
   nvar = _nstate + nmoist + ntrace
@@ -584,12 +603,14 @@ function volumerhs!(::Val{3}, ::Val{N}, ::Val{nmoist}, ::Val{ntrace},
   rhs = reshape(rhs, Nq, Nq, Nq, nvar, nelem)
   vgeo = reshape(vgeo, Nq, Nq, Nq, _nvgeo, nelem)
 
-  s_F = Array{DFloat}(undef, Nq, Nq, Nq, _nstate)
-  s_G = Array{DFloat}(undef, Nq, Nq, Nq, _nstate)
-  s_H = Array{DFloat}(undef, Nq, Nq, Nq, _nstate)
+  s_F = Array{DFloat}(undef, Nq, Nq, Nq, _nstate + nmoist)
+  s_G = Array{DFloat}(undef, Nq, Nq, Nq, _nstate + nmoist)
+  s_H = Array{DFloat}(undef, Nq, Nq, Nq, _nstate + nmoist)
   l_u = Array{DFloat}(undef, Nq, Nq, Nq)
   l_v = Array{DFloat}(undef, Nq, Nq, Nq)
   l_w = Array{DFloat}(undef, Nq, Nq, Nq)
+  Qstate = MVector{_nstate+nmoist, DFloat}(undef)
+  flux   = MMatrix{3, _nstate+nmoist, DFloat}(undef)
 
   @inbounds for e in elems
     for k = 1:Nq, j = 1:Nq, i = 1:Nq
@@ -600,23 +621,28 @@ function volumerhs!(::Val{3}, ::Val{N}, ::Val{nmoist}, ::Val{ntrace},
       ζx, ζy, ζz = vgeo[i,j,k,_ζx,e], vgeo[i,j,k,_ζy,e], vgeo[i,j,k,_ζz,e]
       z = vgeo[i,j,k,_z,e]
 
-      U, V, W = Q[i, j, k, _U, e], Q[i, j, k, _V, e], Q[i, j, k, _W, e]
-      ρ, E = Q[i, j, k, _ρ, e], Q[i, j, k, _E, e]
+      # TODO: Why don't this work?
+      # Qstate = SVector{_nstate+moist, DFloat}(ntuple(s->Q[i,j,k,s,e],
+      #                                                Val(_nstate+nmoist)))
+      for s = 1:_nstate+nmoist
+        Qstate[s] = Q[i,j,k,s,e]
+      end
 
-      P = gdm1*(E - (U^2 + V^2 + W^2)/(2*ρ) - ρ*gravity*z)
+      ρ = Qstate[_ρ]
+      ρinv = 1 / ρ
+      u = ρinv*Qstate[_U]
+      v = ρinv*Qstate[_V]
+      w = ρinv*Qstate[_W]
 
+      #{{{ Only temporarily removed....
+      #=
       ρx, ρy, ρz = grad[i,j,k,_ρx,e], grad[i,j,k,_ρy,e], grad[i,j,k,_ρz,e]
       ux, uy, uz = grad[i,j,k,_ux,e], grad[i,j,k,_uy,e], grad[i,j,k,_uz,e]
       vx, vy, vz = grad[i,j,k,_vx,e], grad[i,j,k,_vy,e], grad[i,j,k,_vz,e]
       wx, wy, wz = grad[i,j,k,_wx,e], grad[i,j,k,_wy,e], grad[i,j,k,_wz,e]
       Tx, Ty, Tz = grad[i,j,k,_Tx,e], grad[i,j,k,_Ty,e], grad[i,j,k,_Tz,e]
 
-      ρinv = 1 / ρ
-
       ldivu = stokes*(ux + vy + wz)
-      u = ρinv*U
-      v = ρinv*V
-      w = ρinv*W
 
       vfluxρ_x = 0*ρx
       vfluxρ_y = 0*ρy
@@ -638,41 +664,33 @@ function volumerhs!(::Val{3}, ::Val{N}, ::Val{nmoist}, ::Val{ntrace},
       vfluxE_y = u*(vx + uy) + v*(2*vy + ldivu) + w*(vz + wy) + k_μ*Ty
       vfluxE_z = u*(wx + uz) + v*(wy + vz) + w*(2*wz + ldivu) + k_μ*Tz
 
-      fluxρ_x = U           - viscosity*vfluxρ_x
-      fluxU_x = u * U  + P  - viscosity*vfluxU_x
-      fluxV_x = u * V       - viscosity*vfluxV_x
-      fluxW_x = u * W       - viscosity*vfluxW_x
-      fluxE_x = u * (E + P) - viscosity*vfluxE_x
+      flux_x = SVector{_nstate, DFloat}(U           - viscosity*vfluxρ_x,
+                                        u * U  + P  - viscosity*vfluxU_x,
+                                        u * V       - viscosity*vfluxV_x,
+                                        u * W       - viscosity*vfluxW_x,
+                                        u * (E + P) - viscosity*vfluxE_x)
 
-      fluxρ_y = V           - viscosity*vfluxρ_y
-      fluxU_y = v * U       - viscosity*vfluxU_y
-      fluxV_y = v * V + P   - viscosity*vfluxV_y
-      fluxW_y = v * W       - viscosity*vfluxW_y
-      fluxE_y = v * (E + P) - viscosity*vfluxE_y
+      flux_y = SVector{_nstate, DFloat}(V           - viscosity*vfluxρ_y,
+                                        v * U       - viscosity*vfluxU_y,
+                                        v * V + P   - viscosity*vfluxV_y,
+                                        v * W       - viscosity*vfluxW_y,
+                                        v * (E + P) - viscosity*vfluxE_y)
 
-      fluxρ_z = W           - viscosity*vfluxρ_z
-      fluxU_z = w * U       - viscosity*vfluxU_z
-      fluxV_z = w * V       - viscosity*vfluxV_z
-      fluxW_z = w * W + P   - viscosity*vfluxW_z
-      fluxE_z = w * (E + P) - viscosity*vfluxE_z
+      flux_z = SVector{_nstate, DFloat}(W           - viscosity*vfluxρ_z,
+                                        w * U       - viscosity*vfluxU_z,
+                                        w * V       - viscosity*vfluxV_z,
+                                        w * W + P   - viscosity*vfluxW_z,
+                                        w * (E + P) - viscosity*vfluxE_z)
+      =#
+      #}}}
 
-      s_F[i, j, k, _ρ] = MJ * (ξx * fluxρ_x + ξy * fluxρ_y + ξz * fluxρ_z)
-      s_F[i, j, k, _U] = MJ * (ξx * fluxU_x + ξy * fluxU_y + ξz * fluxU_z)
-      s_F[i, j, k, _V] = MJ * (ξx * fluxV_x + ξy * fluxV_y + ξz * fluxV_z)
-      s_F[i, j, k, _W] = MJ * (ξx * fluxW_x + ξy * fluxW_y + ξz * fluxW_z)
-      s_F[i, j, k, _E] = MJ * (ξx * fluxE_x + ξy * fluxE_y + ξz * fluxE_z)
+      fluxfun!(Val(nmoist), flux, Qstate, ρ * z * gravity)
 
-      s_G[i, j, k, _ρ] = MJ * (ηx * fluxρ_x + ηy * fluxρ_y + ηz * fluxρ_z)
-      s_G[i, j, k, _U] = MJ * (ηx * fluxU_x + ηy * fluxU_y + ηz * fluxU_z)
-      s_G[i, j, k, _V] = MJ * (ηx * fluxV_x + ηy * fluxV_y + ηz * fluxV_z)
-      s_G[i, j, k, _W] = MJ * (ηx * fluxW_x + ηy * fluxW_y + ηz * fluxW_z)
-      s_G[i, j, k, _E] = MJ * (ηx * fluxE_x + ηy * fluxE_y + ηz * fluxE_z)
-
-      s_H[i, j, k, _ρ] = MJ * (ζx * fluxρ_x + ζy * fluxρ_y + ζz * fluxρ_z)
-      s_H[i, j, k, _U] = MJ * (ζx * fluxU_x + ζy * fluxU_y + ζz * fluxU_z)
-      s_H[i, j, k, _V] = MJ * (ζx * fluxV_x + ζy * fluxV_y + ζz * fluxV_z)
-      s_H[i, j, k, _W] = MJ * (ζx * fluxW_x + ζy * fluxW_y + ζz * fluxW_z)
-      s_H[i, j, k, _E] = MJ * (ζx * fluxE_x + ζy * fluxE_y + ζz * fluxE_z)
+      for s = 1:_nstate+nmoist
+        s_F[i, j, k, s] = MJ * (ξx * flux[1, s] + ξy * flux[2, s] + ξz * flux[3, s])
+        s_G[i, j, k, s] = MJ * (ηx * flux[1, s] + ηy * flux[2, s] + ηz * flux[3, s])
+        s_H[i, j, k, s] = MJ * (ζx * flux[1, s] + ζy * flux[2, s] + ζz * flux[3, s])
+      end
 
       # buoyancy term
       rhs[i, j, k, _W, e] -= ρ * gravity
@@ -682,21 +700,21 @@ function volumerhs!(::Val{3}, ::Val{N}, ::Val{nmoist}, ::Val{ntrace},
     end
 
     # loop of ξ-grid lines
-    for s = 1:_nstate, k = 1:Nq, j = 1:Nq, i = 1:Nq
+    for s = 1:_nstate+nmoist, k = 1:Nq, j = 1:Nq, i = 1:Nq
       MJI = vgeo[i, j, k, _MJI, e]
       for n = 1:Nq
         rhs[i, j, k, s, e] += MJI * D[n, i] * s_F[n, j, k, s]
       end
     end
     # loop of η-grid lines
-    for s = 1:_nstate, k = 1:Nq, j = 1:Nq, i = 1:Nq
+    for s = 1:_nstate+nmoist, k = 1:Nq, j = 1:Nq, i = 1:Nq
       MJI = vgeo[i, j, k, _MJI, e]
       for n = 1:Nq
         rhs[i, j, k, s, e] += MJI * D[n, j] * s_G[i, n, k, s]
       end
     end
     # loop of ζ-grid lines
-    for s = 1:_nstate, k = 1:Nq, j = 1:Nq, i = 1:Nq
+    for s = 1:_nstate+nmoist, k = 1:Nq, j = 1:Nq, i = 1:Nq
       MJI = vgeo[i, j, k, _MJI, e]
       for n = 1:Nq
         rhs[i, j, k, s, e] += MJI * D[n, k] * s_H[i, j, n, s]
@@ -705,6 +723,8 @@ function volumerhs!(::Val{3}, ::Val{N}, ::Val{nmoist}, ::Val{ntrace},
 
     # loop over moist variables
     # FIXME: Currently just passive advection
+    #{{{
+    #=
     for m = 1:nmoist
       s = _nstate + m
       ss = _nstategrad + 3*(m-1)
@@ -748,6 +768,8 @@ function volumerhs!(::Val{3}, ::Val{N}, ::Val{nmoist}, ::Val{ntrace},
         end
       end
     end
+    =#
+    #}}}
 
     # loop over tracer variables
     for t = 1:ntrace
